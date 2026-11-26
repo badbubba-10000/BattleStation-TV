@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "837929364702",
+    "project_id": "battlestation-tv-cloud-sync",
+    "storage_bucket": "battlestation-tv-cloud-sync.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:837929364702:android:4bb5be6088628efb74a64f",
+        "android_client_info": {
+          "package_name": "com.getetv.player"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB_K3J3xGNlUUR6MZ0RjQlZJoNKtv6JSag"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:837929364702:android:94f74819013d357974a64f",
+        "android_client_info": {
+          "package_name": "tv.battlestation.bstv"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB_K3J3xGNlUUR6MZ0RjQlZJoNKtv6JSag"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

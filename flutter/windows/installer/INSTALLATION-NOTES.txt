@@ -1,0 +1,9 @@
+Installation and removal
+
+This package includes the complete x64 player, Flutter engine, native playback and SQLite libraries, and application-local Visual C++ runtime DLLs. It performs no prerequisite downloads. Compatible Windows system libraries and graphics drivers are required.
+
+Current-user installation is supported. All-users installation is intentionally unavailable until cross-user data ownership and elevated uninstall have been validated. Express creates Desktop and Start menu shortcuts. Custom allows directory, shortcuts and optional sign-in startup choices. Updates preserve personal data; same-version setup repairs installed files; older versions are blocked.
+
+Use Windows Installed apps or the Start menu Uninstall shortcut. Selective removal preserves accounts/settings by default. Accounts, credentials, playlists, favorites, history and DVR/download queues share stores and are grouped honestly. Recordings, downloaded media, externally exported backups, generic shared temporary caches and cloud-hosted records are never deleted. Complete mode removes all supported local categories for the current user, not those excluded items or other users' data.
+
+License notices and corresponding-source materials are in the installed licenses and source folders. This installer is unsigned; signing requires a publisher certificate. No clean offline VM certification is implied merely by successful compilation.

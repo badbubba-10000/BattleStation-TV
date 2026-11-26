@@ -1,0 +1,360 @@
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:media_kit/media_kit.dart' as mk;
+import 'package:media_kit_video/media_kit_video.dart';
+
+import 'ca_bundle.dart';
+import 'engine.dart';
+import 'player_options.dart';
+import 'track_label.dart';
+import 'playback_diagnostics.dart';
+
+/// libmpv through media_kit. Initializes media_kit itself the first time one is made.
+class MediaKitEngine implements PlaybackEngine, DiagnosticPlaybackEngine {
+  MediaKitEngine({
+    String? hwdec,
+    bool tlsVerify = true,
+    String? subLang,
+    String? audioLang,
+  }) {
+    mk.MediaKit.ensureInitialized(); // idempotent: main did it already, except on Windows, where libmpv loads with the first picture
+    _player = mk.Player(
+      configuration: const mk.PlayerConfiguration(title: 'BattleStation TV'),
+    );
+    _video = VideoController(
+      _player,
+      configuration: VideoControllerConfiguration(
+        hwdec: hwdec ?? EngineOptions.hwdec,
+      ),
+    );
+    _native = _player.platform as mk.NativePlayer;
+    _ready = _applyOptions(tlsVerify, subLang, audioLang);
+    _subs = [
+      _player.stream.playing.listen((p) => _paused = !p),
+      _player.stream.error.listen(_onError),
+      _player.stream.track.listen((_) => _readSelection()),
+      _player.stream.tracks.listen((_) => _readSelection()),
+      _player.stream.position.listen((position) {
+        if (position.inMilliseconds > 0) {
+          _stage = PlaybackStage.playing;
+          unawaited(_readCodecs());
+        }
+      }),
+    ];
+  }
+
+  late final mk.Player _player;
+  late final VideoController _video;
+  late final mk.NativePlayer _native;
+  late final Future<void>
+  _ready; // the options are in before the first file opens
+  late final List<StreamSubscription<Object?>> _subs;
+  final _failures = StreamController<String>.broadcast();
+  final _subtitleScale = ValueNotifier<double>(1);
+  bool _paused = false;
+  bool _disposed = false;
+  String? _lastError;
+  int _aid = 0;
+  int _sid = 0;
+  final _loads = LatestMediaLoad();
+  PlaybackStage _stage = PlaybackStage.initializing;
+  PlaybackIssue? _issue;
+  String? _protocol, _videoCodec, _audioCodec;
+  bool _readingCodecs = false;
+  @override
+  PlaybackDiagnostics get diagnostics => PlaybackDiagnostics(
+    stage: _issue != null
+        ? PlaybackStage.failed
+        : buffering
+        ? PlaybackStage.buffering
+        : _stage,
+    protocol: _protocol,
+    issue: _issue,
+    videoCodec: _videoCodec,
+    audioCodec: _audioCodec,
+    outputReady: _video.id.value != null,
+  );
+  Future<void> _readCodecs() async {
+    if (_disposed || _readingCodecs || _videoCodec != null) return;
+    _readingCodecs = true;
+    final generation = _loads.generation;
+    try {
+      final video = await _native
+          .getProperty('video-codec')
+          .timeout(const Duration(seconds: 2));
+      final audio = await _native
+          .getProperty('audio-codec-name')
+          .timeout(const Duration(seconds: 2));
+      if (_disposed || generation != _loads.generation) return;
+      _videoCodec = RegExp(r'^(h264|hevc|av1|vp9|vp8|mpeg2video|mpeg4)\b')
+          .firstMatch(video.toLowerCase())
+          ?.group(1);
+      _audioCodec = RegExp(r'^(aac|mp3|ac3|eac3|opus|flac|vorbis|pcm\w*)\b')
+          .firstMatch(audio.toLowerCase())
+          ?.group(1);
+    } catch (_) {
+    } finally {
+      _readingCodecs = false;
+    }
+  }
+
+  void _failed(PlaybackIssue issue) {
+    if (_disposed) return;
+    _issue = issue;
+    _stage = PlaybackStage.failed;
+    _lastError = issue.message;
+    if (!_failures.isClosed) _failures.add(issue.message);
+  }
+
+  Future<void> _applyOptions(
+    bool tlsVerify,
+    String? subLang,
+    String? audioLang,
+  ) async {
+    final options = {
+      ...EngineOptions.hardened(tlsVerify: tlsVerify),
+      if (subLang != null && subLang.isNotEmpty) 'slang': subLang,
+      if (audioLang != null && audioLang.isNotEmpty) 'alang': audioLang,
+    };
+    for (final e in options.entries) {
+      await _set(e.key, e.value);
+    }
+    if (tlsVerify) {
+      try {
+        await _set('tls-ca-file', await CaBundle.path());
+      } catch (_) {} // no asset (a test): mpv falls back to its own store
+    }
+  }
+
+  Future<void> _set(String name, String value) async {
+    if (_disposed) return;
+    try {
+      await _native.setProperty(name, value);
+    } catch (
+      _
+    ) {} // a pre-init-only option or a disposed player: nothing to do about it
+  }
+
+  /// An error log line is only a failure when mpv gave up on the file (it went idle); the ffmpeg reconnect logic logs and recovers.
+  Future<void> _onError(String reason) async {
+    final issue = PlaybackIssue.fromBackend(reason);
+    final generation = _loads.generation;
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+    if (_disposed || generation != _loads.generation) return;
+    try {
+      if (await _native
+              .getProperty('idle-active')
+              .timeout(const Duration(seconds: 2)) ==
+          'yes') {
+        _failed(issue);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _readSelection() async {
+    if (_disposed) return;
+    try {
+      _aid = int.tryParse(await _native.getProperty('aid')) ?? 0;
+      _sid = int.tryParse(await _native.getProperty('sid')) ?? 0;
+    } catch (_) {}
+  }
+
+  @override
+  Stream<String> get failures => _failures.stream;
+  @override
+  String? get lastError => _lastError;
+  @override
+  double get position => _player.state.position.inMicroseconds / 1e6;
+  @override
+  double get duration => _player.state.duration.inMicroseconds / 1e6;
+  @override
+  bool get paused => _paused;
+  @override
+  bool get buffering => _player.state.buffering;
+  @override
+  bool get atEof => _player.state.completed;
+  @override
+  double get speed => _player.state.rate;
+  @override
+  double get aspect {
+    final w = _player.state.width, h = _player.state.height;
+    return w != null && h != null && w > 0 && h > 0 ? w / h : 0;
+  }
+
+  @override
+  int get videoWidth => _player.state.width ?? 0;
+  @override
+  int get videoHeight => _player.state.height ?? 0;
+
+  @override
+  List<Track> get tracks => [
+    for (final t in _player.state.tracks.audio)
+      if (int.tryParse(t.id) case final id?)
+        Track(
+          id: id,
+          type: 'audio',
+          lang: t.language,
+          title: t.title,
+          selected: id == _aid,
+        ),
+    for (final t in _player.state.tracks.subtitle)
+      if (int.tryParse(t.id) case final id?)
+        Track(
+          id: id,
+          type: 'sub',
+          lang: t.language,
+          title: t.title,
+          selected: id == _sid,
+        ),
+  ];
+
+  @override
+  void load(String source, {double start = 0}) {
+    _lastError = null;
+    _issue = null;
+    _videoCodec = null;
+    _audioCodec = null;
+    final scheme = Uri.tryParse(source)?.scheme.toLowerCase();
+    _protocol =
+        const {
+          'http',
+          'https',
+          'file',
+          'rtsp',
+          'rtmp',
+          'rtmps',
+          'udp',
+          'rtp',
+          'mms',
+          'mmsh',
+        }.contains(scheme)
+        ? scheme
+        : null;
+    _stage = PlaybackStage.initializing;
+    _paused = false;
+    _aid = 0;
+    _sid = 0;
+    final from = start > 1 ? Duration(seconds: start.toInt()) : null;
+    unawaited(
+      _loads.submit(
+        _ready,
+        () async {
+          _stage = PlaybackStage.loading;
+          await _player.open(mk.Media(source, start: from));
+        },
+        (error) => _failed(
+          error is TimeoutException
+              ? const PlaybackIssue(
+                  PlaybackFailureKind.initialization,
+                  'Media backend or video output initialization timed out.',
+                )
+              : PlaybackIssue.fromBackend(error),
+        ),
+      ),
+    );
+  }
+
+  @override
+  void setPaused(bool paused) {
+    _paused = paused;
+    unawaited(
+      (paused ? _player.pause() : _player.play()).catchError((Object _) {}),
+    );
+  }
+
+  @override
+  void seekTo(double seconds) => unawaited(
+    _player
+        .seek(Duration(milliseconds: (seconds * 1000).round()))
+        .catchError((Object _) {}),
+  );
+
+  @override
+  void seekBy(double seconds) => seekTo(position + seconds);
+
+  @override
+  void setSpeed(double speed) =>
+      unawaited(_player.setRate(speed).catchError((Object _) {}));
+
+  @override
+  void selectSubtitle(int id) {
+    _sid = id;
+    unawaited(
+      _player
+          .setSubtitleTrack(
+            id == 0
+                ? mk.SubtitleTrack.no()
+                : mk.SubtitleTrack('$id', null, null),
+          )
+          .catchError((Object _) {}),
+    );
+  }
+
+  @override
+  void selectAudio(int id) {
+    _aid = id;
+    unawaited(
+      _player
+          .setAudioTrack(mk.AudioTrack('$id', null, null))
+          .catchError((Object _) {}),
+    );
+  }
+
+  @override
+  void addSubtitle(String path) => unawaited(
+    _player
+        .setSubtitleTrack(mk.SubtitleTrack.uri(Uri.file(path).toString()))
+        .then((_) => _readSelection())
+        .catchError((Object _) {}),
+  );
+
+  @override
+  void setSubtitleStyle({required double scale, required double delay}) {
+    _subtitleScale.value = scale;
+    unawaited(_set('sub-delay', delay.toString()));
+  }
+
+  @override
+  void setVolume(double volume) =>
+      unawaited(_player.setVolume(volume * 100).catchError((Object _) {}));
+
+  @override
+  void setBuffer(int maxBytes, int readaheadSecs) {
+    unawaited(_set('demuxer-max-bytes', '$maxBytes'));
+    unawaited(_set('demuxer-readahead-secs', '$readaheadSecs'));
+  }
+
+  @override
+  Widget buildVideo(BoxFit fit) => ValueListenableBuilder<double>(
+    valueListenable: _subtitleScale,
+    builder: (_, scale, _) => Video(
+      controller: _video,
+      fit: fit,
+      controls: NoVideoControls,
+      fill: Colors.black,
+      pauseUponEnteringBackgroundMode: false, // the default pauses the sound when the screen turns off; the media session decides what plays in the background
+      subtitleViewConfiguration: SubtitleViewConfiguration(
+        style: TextStyle(
+          fontSize: 32 * scale,
+          color: Colors.white,
+          backgroundColor: const Color(0xAA000000),
+          height: 1.3,
+        ),
+        padding: const EdgeInsets.fromLTRB(24, 0, 24, 56),
+      ),
+    ),
+  );
+
+  @override
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    _loads.dispose();
+    for (final s in _subs) {
+      s.cancel();
+    }
+    _failures.close();
+    unawaited(_player.dispose());
+  }
+}

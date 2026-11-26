@@ -1,0 +1,16 @@
+.dart_tool/
+.gradle/
+.idea/
+build/
+**/ephemeral/
+**/staging/
+**/output/
+**/local.properties
+**/key.properties
+*.jks
+*.keystore
+*.pfx
+*.p12
+*.log
+.env
+.env.*

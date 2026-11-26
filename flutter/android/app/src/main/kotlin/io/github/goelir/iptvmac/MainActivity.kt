@@ -1,0 +1,185 @@
+// Modified for BattleStation TV, 2026-11-22. See BSTV-NOTICE.md.
+package tv.battlestation.bstv
+
+import android.Manifest
+import android.app.PendingIntent
+import android.app.PictureInPictureParams
+import android.app.RemoteAction
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.content.res.Configuration
+import android.graphics.drawable.Icon
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
+import android.util.Rational
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import com.ryanheise.audioservice.AudioServiceActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodChannel
+import java.io.File
+
+/**
+ * Picture in Picture for the Flutter player (lib/player/android_player_system.dart) and the base class audio_service needs.
+ * Dart -> native: isSupported, enter {aspect, playing}, update {aspect, playing, autoEnter}, requestNotificationPermission,
+ * and for the in-app update (lib/core/apk_update.dart): abis, canInstall, openInstallSettings, installApk {path}.
+ * Native -> Dart: pipChanged(bool), pipAction() (the play/pause button of the PiP window).
+ */
+class MainActivity : AudioServiceActivity() {
+    private var channel: MethodChannel? = null
+    private var aspect = 16.0 / 9.0
+    private var playing = false
+    private var autoEnter = false
+
+    private val actionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == ACTION_PLAY_PAUSE) channel?.invokeMethod("pipAction", null)
+        }
+    }
+
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "tv.battlestation.bstv/storage").setMethodCallHandler { call, result ->
+            if (call.method != "freeBytes") { result.notImplemented() }
+            else {
+                val folder = call.arguments as? String
+                if (folder.isNullOrEmpty()) result.error("path", "Choose a recording folder", null)
+                else try { result.success(android.os.StatFs(folder).availableBytes) }
+                catch (_: Exception) { result.error("storage", "Unable to measure available storage", null) }
+            }
+        }
+        channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).also { ch ->
+            ch.setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "isSupported" -> result.success(pipSupported())
+                    "isTelevision" -> result.success(isTelevision())
+                    "enter" -> {
+                        remember(call.argument<Double>("aspect"), call.argument<Boolean>("playing"))
+                        result.success(pipSupported() && enterPip())
+                    }
+                    "update" -> {
+                        remember(call.argument<Double>("aspect"), call.argument<Boolean>("playing"))
+                        autoEnter = call.argument<Boolean>("autoEnter") ?: false
+                        if (pipSupported()) setPictureInPictureParams(params())
+                        result.success(null)
+                    }
+                    "abis" -> result.success(Build.SUPPORTED_ABIS.toList())
+                    "canInstall" -> result.success(packageManager.canRequestPackageInstalls())
+                    "openInstallSettings" -> {
+                        startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+                        result.success(null)
+                    }
+                    "validateApk" -> result.success(compatibleApk(call.argument<String>("path"), call.argument<Number>("build")?.toLong(), call.argument<String>("packageId")))
+                    "installApk" -> result.success(installApk(call.argument<String>("path")))
+                    "requestNotificationPermission" -> {
+                        requestNotificationPermission()
+                        result.success(null)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+        }
+        ContextCompat.registerReceiver(this, actionReceiver, IntentFilter(ACTION_PLAY_PAUSE), ContextCompat.RECEIVER_NOT_EXPORTED)
+    }
+
+    override fun onDestroy() {
+        runCatching { unregisterReceiver(actionReceiver) }
+        super.onDestroy()
+    }
+
+    private fun pipSupported() =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
+
+    private fun remember(a: Double?, p: Boolean?) {
+        // The window accepts ratios between 1:2.39 and 2.39:1; 0 = not known yet.
+        aspect = if (a != null && a > 0) a.coerceIn(0.42, 2.39) else 16.0 / 9.0
+        playing = p ?: playing
+    }
+
+    private fun params(): PictureInPictureParams {
+        val b = PictureInPictureParams.Builder()
+            .setAspectRatio(Rational((aspect * 1000).toInt(), 1000))
+            .setActions(listOf(playPauseAction()))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) b.setAutoEnterEnabled(autoEnter && playing)
+        return b.build()
+    }
+
+    private fun playPauseAction(): RemoteAction {
+        val icon = Icon.createWithResource(this, if (playing) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play)
+        val intent = PendingIntent.getBroadcast(
+            this, 0, Intent(ACTION_PLAY_PAUSE).setPackage(packageName), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        return RemoteAction(icon, "Play/Pause", "Play/Pause", intent)
+    }
+
+    private fun enterPip(): Boolean = try {
+        enterPictureInPictureMode(params())
+    } catch (e: IllegalStateException) {
+        false
+    }
+
+    /** Before Android 12 the system does not enter PiP by itself: do it when the user leaves while a video plays. */
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S && pipSupported() && autoEnter && playing) enterPip()
+    }
+
+    override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        channel?.invokeMethod("pipChanged", isInPictureInPictureMode)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun compatibleApk(path: String?, expectedBuild: Long? = null, expectedPackage: String? = packageName): Boolean { return try {
+        val file = File(path ?: return false).canonicalFile
+        if (file.parentFile != File(cacheDir, "updates").canonicalFile || !file.isFile || expectedPackage != packageName) return false
+        val flags = if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES
+        val candidate = packageManager.getPackageArchiveInfo(file.path, flags) ?: return false
+        val installed = packageManager.getPackageInfo(packageName, flags)
+        val candidateCode = if (Build.VERSION.SDK_INT >= 28) candidate.longVersionCode else candidate.versionCode.toLong()
+        val installedCode = if (Build.VERSION.SDK_INT >= 28) installed.longVersionCode else installed.versionCode.toLong()
+        if (candidate.packageName != packageName || candidateCode < installedCode || (expectedBuild != null && candidateCode != expectedBuild)) return false
+        val current = if (Build.VERSION.SDK_INT >= 28) installed.signingInfo?.apkContentsSigners else installed.signatures
+        val incoming = if (Build.VERSION.SDK_INT >= 28) {
+            val info = candidate.signingInfo
+            if (info?.hasMultipleSigners() == true) info.apkContentsSigners else info?.signingCertificateHistory
+        } else candidate.signatures
+        current != null && incoming != null && current.isNotEmpty() && current.all { signer -> incoming.any { it == signer } }
+    } catch (_: Exception) { false } }
+
+    /** Hands an APK of the app's own cache (cache/updates) to the system installer, which asks the user to confirm. False when it cannot. */
+    private fun installApk(path: String?): Boolean { return try {
+        val file = File(path ?: return false).canonicalFile
+        if (file.parentFile != File(cacheDir, "updates").canonicalFile) return false
+        if (!compatibleApk(file.path)) return false
+        val uri = FileProvider.getUriForFile(this, "$packageName.updates", file)
+        startActivity(
+            Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+        true
+    } catch (e: Exception) {
+        false
+    } }
+
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 4711)
+    }
+
+    /** Android TV, Google TV and Fire TV: a remote control and no touch screen (lib/app/device.dart). */
+    private fun isTelevision(): Boolean {
+        val ui = getSystemService(Context.UI_MODE_SERVICE) as android.app.UiModeManager
+        return ui.currentModeType == Configuration.UI_MODE_TYPE_TELEVISION || packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK)
+    }
+
+    companion object {
+        private const val CHANNEL = "tv.battlestation.bstv/pip"
+        private const val ACTION_PLAY_PAUSE = "tv.battlestation.bstv.PIP_PLAY_PAUSE"
+    }
+}

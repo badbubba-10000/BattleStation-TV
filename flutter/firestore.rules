@@ -1,0 +1,23 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function owner(uid) { return request.auth != null && request.auth.uid == uid; }
+    function edition(app) { return app in ['battleStationTV', 'getETV']; }
+    function themeValid(d) { return d.schema == 1 && d.theme is string && d.theme.size() <= 262144 && d.updatedAt is timestamp; }
+    match /users/{uid}/settings/{app} {
+      allow get, delete: if owner(uid) && edition(app);
+      allow create, update: if owner(uid) && edition(app) && request.resource.data.keys().hasOnly(['schema','theme','updatedAt']) && themeValid(request.resource.data);
+      match /backups/{slot} {
+        function allowed() { return owner(uid) && edition(app) && slot in ['slot1','slot2','slot3','slot4','slot5']; }
+        function valid() {
+          let d = request.resource.data;
+          return d.keys().hasOnly(['schema','name','theme','createdAt','updatedAt']) && themeValid(d) && d.createdAt is timestamp && d.name is string && d.name.matches('^[a-zA-Z0-9 _.-]{1,60}$');
+        }
+        allow get, delete: if allowed();
+        allow create: if allowed() && valid();
+        allow update: if allowed() && valid() && request.resource.data.createdAt == resource.data.createdAt && request.resource.data.theme == resource.data.theme;
+      }
+    }
+    match /{document=**} { allow read, write: if false; }
+  }
+}

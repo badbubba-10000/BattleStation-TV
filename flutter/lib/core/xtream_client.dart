@@ -1,0 +1,195 @@
+import 'dart:convert';
+import 'dart:async';
+import 'dart:io';
+
+import 'package:http/http.dart' as http;
+
+import 'api_session.dart';
+import 'errors.dart';
+import 'item_info.dart';
+import 'json_util.dart';
+import 'models.dart';
+import 'subscription_info.dart';
+import 'xtream_urls.dart';
+
+class XtreamClient {
+  XtreamClient(
+    this.urls, {
+    http.Client? client,
+    this.authenticationTimeout = const Duration(seconds: 20),
+    this.requestTimeout = const Duration(minutes: 10),
+    this.idleTimeout = const Duration(seconds: 60),
+  }) : client = client ?? http.Client();
+
+  final XtreamURLs urls;
+  final http.Client client;
+  final Duration authenticationTimeout, requestTimeout, idleTimeout;
+  bool _authenticationConfirmed = false;
+
+  /// The decoded JSON of an endpoint (null for an empty body).
+  Future<Object?> json(Uri url) async {
+    final stage = XtreamStage.forAction(url.queryParameters['action']);
+    try {
+      final data = await apiGet(
+        client,
+        url,
+        timeout: stage == XtreamStage.authentication
+            ? authenticationTimeout
+            : requestTimeout,
+        idleTimeout: idleTimeout,
+        headers: const {
+          'Accept': 'application/json',
+          'User-Agent': 'BattleStationTV',
+        },
+      );
+      if (data.isEmpty) return null;
+      final text = utf8.decode(data).replaceFirst(RegExp(r'^\uFEFF'), '');
+      return jsonDecode(text);
+    } on IPTVError catch (e) {
+      if (e.code != null) throw _failure(stage, XtreamFailureKind.http, e.code);
+      if (stage == XtreamStage.authentication) rethrow;
+      throw _failure(stage, XtreamFailureKind.invalidResponse);
+    } on TimeoutException {
+      throw _failure(stage, XtreamFailureKind.timeout);
+    } on http.ClientException {
+      throw _failure(stage, XtreamFailureKind.network);
+    } on SocketException {
+      throw _failure(stage, XtreamFailureKind.network);
+    } on FormatException {
+      if (stage != XtreamStage.authentication) {
+        throw _failure(stage, XtreamFailureKind.invalidResponse);
+      }
+      throw IPTVError.badResponse;
+    }
+  }
+
+  XtreamRequestFailure _failure(
+    XtreamStage stage,
+    XtreamFailureKind kind, [
+    int? code,
+  ]) => XtreamRequestFailure(
+    stage: stage,
+    kind: kind,
+    statusCode: code,
+    authenticationConfirmed: _authenticationConfirmed,
+  );
+
+  /// A list endpoint. Panels answer `null`, `false` or an empty body for a section they do not have (e.g. no series).
+  Future<List<Map<String, dynamic>>> array(
+    String action, [
+    Map<String, String> params = const {},
+  ]) async {
+    final o = await json(urls.api(action, params));
+    if (o == null || o is bool) return const [];
+    return objectList(o) ??
+        (throw _failure(
+          XtreamStage.forAction(action),
+          XtreamFailureKind.invalidResponse,
+        ));
+  }
+
+  Future<void> authenticate() async {
+    _authenticationConfirmed = false;
+    final o = await json(urls.api(null));
+    final u = o is Map ? o['user_info'] : null;
+    if (u is! Map) throw IPTVError.badResponse;
+    if (intOf(u['auth']) != 1) throw IPTVError.badCredentials;
+    final status = str(u['status'])?.trim().toLowerCase();
+    if (const {
+      'expired',
+      'disabled',
+      'banned',
+      'inactive',
+      'blocked',
+    }.contains(status)) {
+      throw IPTVError.accountInactive;
+    }
+    _authenticationConfirmed = true;
+  }
+
+  /// What the panel says about the subscription (the expiry date, the allowed connections). A panel that does not send a field leaves it null.
+  Future<SubscriptionInfo> subscription() async {
+    final o = await json(urls.api(null));
+    final u = o is Map ? o['user_info'] : null;
+    if (u is! Map) throw IPTVError.badResponse;
+    if (intOf(u['auth']) != 1) throw IPTVError.badCredentials;
+    return SubscriptionInfo.fromUserInfo(u);
+  }
+
+  /// The time zone name the panel uses for timeshift URLs (`server_info.timezone`, e.g. "Europe/Paris"), or null if
+  /// unknown. Not validated here: there is no time zone database in the core (see `XtreamURLs.timeshift`).
+  Future<String?> serverTimeZoneName() async {
+    try {
+      final o = await json(urls.api(null));
+      final info = o is Map ? o['server_info'] : null;
+      return info is Map ? str(info['timezone']) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<List<Object?>> _listings(
+    String action,
+    String id, [
+    Map<String, String> extra = const {},
+  ]) async {
+    final o = await json(urls.api(action, {'stream_id': id, ...extra}));
+    if (o is! Map) throw IPTVError.badResponse;
+    final l = o['epg_listings'];
+    return l is List ? l : const [];
+  }
+
+  EPGEntry? _entry(Object? d) {
+    if (d is! Map) return null;
+    final t = str(d['title']);
+    final s = intOf(d['start_timestamp']), e = intOf(d['stop_timestamp']);
+    if (t == null || s == null || e == null) return null;
+    final String title;
+    try {
+      title = utf8.decode(base64.decode(t));
+    } on FormatException {
+      return null;
+    }
+    return EPGEntry(
+      title: title,
+      start: DateTime.fromMillisecondsSinceEpoch(s * 1000, isUtc: true),
+      end: DateTime.fromMillisecondsSinceEpoch(e * 1000, isUtc: true),
+    );
+  }
+
+  /// The current and upcoming programs of a live channel.
+  Future<List<EPGEntry>> epgShort(String streamId, int limit) async => [
+    for (final d in await _listings('get_short_epg', streamId, {
+      'limit': '$limit',
+    }))
+      ?_entry(d),
+  ];
+
+  Future<String?> epgNow(String streamId) async =>
+      (await epgShort(streamId, 1)).firstOrNull?.title;
+
+  Future<List<EPGEntry>> epgArchive(String streamId) async => [
+    for (final d in await _listings('get_simple_data_table', streamId))
+      ?_entry(d),
+  ];
+
+  /// The whole `get_series_info` answer (episodes and details).
+  Future<Map<String, dynamic>> rawSeriesInfo(String id) async {
+    final o = await json(urls.api('get_series_info', {'series_id': id}));
+    if (o is! Map) throw IPTVError.badResponse;
+    return o.cast<String, dynamic>();
+  }
+
+  /// Panels answer `[]`, `null` or `false` for a title they know nothing about: that is "no details", not an error.
+  Future<ItemInfo> _details(String action, Map<String, String> params) async {
+    final o = await json(urls.api(action, params));
+    return ItemInfo.fromResponse(
+      o is Map ? o.cast<String, dynamic>() : const {},
+    );
+  }
+
+  Future<ItemInfo> vodInfo(String streamId) =>
+      _details('get_vod_info', {'vod_id': streamId});
+  Future<ItemInfo> seriesInfo(String seriesId) =>
+      _details('get_series_info', {'series_id': seriesId});
+}

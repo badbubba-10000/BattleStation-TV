@@ -1,0 +1,11 @@
+Runtime distribution notes
+
+Microsoft Visual C++ x64 runtime DLLs are copied only from the licensed Visual Studio REDIST directory. Redistribution is subject to the installed Visual Studio license and REDIST list, not a grant by this project. Windows OS components are not bundled or removed.
+https://learn.microsoft.com/cpp/windows/redistributing-visual-cpp-files
+
+Flutter and Dart: BSD-style licenses, notices copied from installed dependencies. SQLite: public domain. libmpv/FFmpeg components are bundled by media_kit_libs_windows_video 1.0.11 from the exact prebuilt package declared in its CMakeLists.txt:
+https://github.com/media-kit/libmpv-win32-video-build/releases/tag/2023-09-24
+https://github.com/media-kit/libmpv-win32-video-build
+The package's declared archive is mpv-dev-x86_64-20230924-git-652a1dd.7z. Its license and exact upstream component sources/build configuration must accompany public distribution in compliance with their applicable licenses. The installed app source ZIP contains current local modifications and the dependency lockfile. Full notices are in Acknowledgements.md and per-package license files.
+
+No installer output is automatically published. Before distributing GPL builds, supply complete corresponding source and exact third-party build inputs, or a legally valid source offer. Merely linking a stale upstream repository is insufficient. Public redistribution remains gated on this license/source review and clean-VM testing.
